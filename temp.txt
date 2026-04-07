@@ -1,0 +1,260 @@
+import json
+import os
+
+from dynamo_service import get_items_from_date
+from transformer import transform_items
+from transferToS3 import append_items_to_s3
+
+
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "your-bucket-name")
+FILE_KEY = os.environ.get("FILE_KEY", "exports/call_records.json")
+FROM_DATE = os.environ.get("FROM_DATE", "2026-04-01")
+
+
+def lambda_handler(event, context):
+    try:
+        raw_items = get_items_from_date(FROM_DATE)
+
+        if not raw_items:
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "message": "No records found in DynamoDB",
+                    "fetched_count": 0
+                })
+            }
+
+        transformed_items = transform_items(raw_items)
+
+        result = append_items_to_s3(
+            bucket_name=BUCKET_NAME,
+            file_key=FILE_KEY,
+            new_items=transformed_items
+        )
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "DynamoDB data fetched and written to S3 successfully",
+                "fetched_count": len(transformed_items),
+                "newly_added": result["newly_added"],
+                "total_items_in_file": result["total_items"],
+                "bucket": BUCKET_NAME,
+                "key": FILE_KEY
+            })
+        }
+
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "message": "Lambda execution failed",
+                "error": str(e)
+            })
+        }
+
+
+
+dyser
+
+import os
+import boto3
+from boto3.dynamodb.conditions import Attr
+from botocore.exceptions import ClientError
+
+dynamodb = boto3.resource("dynamodb")
+TABLE_NAME = os.environ.get("TABLE_NAME", "your-table-name")
+table = dynamodb.Table(TABLE_NAME)
+
+
+def get_items_from_date(from_date: str):
+    """
+    Fetch items where sk >= CTR#<from_date>T00:00:00Z
+
+    Example sk:
+    CTR#2026-04-01T11:40:05Z
+    """
+    try:
+        items = []
+        start_sk = f"CTR#{from_date}T00:00:00Z"
+
+        scan_kwargs = {
+            "FilterExpression": Attr("sk").gte(start_sk)
+        }
+
+        response = table.scan(**scan_kwargs)
+        items.extend(response.get("Items", []))
+
+        while "LastEvaluatedKey" in response:
+            response = table.scan(
+                ExclusiveStartKey=response["LastEvaluatedKey"],
+                **scan_kwargs
+            )
+            items.extend(response.get("Items", []))
+
+        return items
+
+    except ClientError as e:
+        raise Exception(f"Error fetching data from DynamoDB: {str(e)}")
+
+
+tran
+
+
+from datetime import datetime
+from decimal import Decimal
+
+
+def normalize_value(value):
+    if isinstance(value, Decimal):
+        if value % 1 == 0:
+            return int(value)
+        return float(value)
+    return value
+
+
+def transform_item(item: dict) -> dict:
+    transformed = {
+        "pk": item.get("pk"),
+        "sk": item.get("sk"),
+        "contactId": item.get("ContactId"),
+        "channel": item.get("Channel"),
+        "initiationMethod": item.get("InitiationMethod"),
+        "initiationTimestamp": item.get("InitiationTimestamp"),
+        "connectedToAgentTimestamp": item.get("ConnectedToAgentTimestamp"),
+        "disconnectTimestamp": item.get("DisconnectTimestamp"),
+        "disconnectReason": item.get("DisconnectReason"),
+        "instanceId": item.get("InstanceId"),
+
+        "agentId": (item.get("Agent") or {}).get("Id"),
+        "agentUsername": (item.get("Agent") or {}).get("Username"),
+
+        "customerType": (item.get("Attributes") or {}).get("customerType"),
+        "issueType": (item.get("Attributes") or {}).get("issueType"),
+        "language": (item.get("Attributes") or {}).get("language"),
+        "region": (item.get("Attributes") or {}).get("region"),
+
+        "customerAddress": (item.get("CustomerEndpoint") or {}).get("Address"),
+        "customerEndpointType": (item.get("CustomerEndpoint") or {}).get("Type"),
+
+        "systemAddress": (item.get("SystemEndpoint") or {}).get("Address"),
+        "systemEndpointType": (item.get("SystemEndpoint") or {}).get("Type"),
+
+        "queueId": (item.get("Queue") or {}).get("Id"),
+        "queueName": (item.get("Queue") or {}).get("Name"),
+
+        "recordingLocation": (item.get("Recording") or {}).get("Location"),
+        "recordingStatus": (item.get("Recording") or {}).get("Status"),
+
+        "sentimentOverall": ((item.get("ContactLens") or {}).get("Sentiment") or {}).get("Overall"),
+        "sentimentScore": ((item.get("ContactLens") or {}).get("Sentiment") or {}).get("Score"),
+
+        "afterContactWorkTime": (item.get("Metrics") or {}).get("AfterContactWorkTime"),
+        "handleTime": (item.get("Metrics") or {}).get("HandleTime"),
+        "holdTime": (item.get("Metrics") or {}).get("HoldTime"),
+        "interactionTime": (item.get("Metrics") or {}).get("InteractionTime"),
+        "queueDuration": ((item.get("Metrics") or {}).get("Queue") or {}).get("Duration"),
+        "queueEnqueueTimestamp": ((item.get("Metrics") or {}).get("Queue") or {}).get("EnqueueTimestamp"),
+
+        "processedAt": datetime.utcnow().isoformat()
+    }
+
+    return {k: normalize_value(v) for k, v in transformed.items()}
+
+
+def transform_items(items: list) -> list:
+    return [transform_item(item) for item in items]
+
+
+transS3
+import json
+import boto3
+from decimal import Decimal
+from botocore.exceptions import ClientError
+
+s3 = boto3.client("s3")
+
+
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            if obj % 1 == 0:
+                return int(obj)
+            return float(obj)
+        return super().default(obj)
+
+
+def read_existing_file(bucket_name: str, file_key: str) -> list:
+    """
+    Reads existing JSONL file from S3.
+    Returns list of JSON objects.
+    If file does not exist, returns empty list.
+    """
+    try:
+        response = s3.get_object(Bucket=bucket_name, Key=file_key)
+        content = response["Body"].read().decode("utf-8").strip()
+
+        if not content:
+            return []
+
+        lines = content.splitlines()
+        data = []
+
+        for line in lines:
+            line = line.strip()
+            if line:
+                data.append(json.loads(line))
+
+        return data
+
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code in ["NoSuchKey", "404"]:
+            return []
+        raise
+
+
+def write_jsonl_to_s3(bucket_name: str, file_key: str, data: list) -> None:
+    """
+    Writes Athena-friendly JSONL to S3.
+    Each row = one JSON object on one line.
+    """
+    jsonl_content = "\n".join(
+        json.dumps(item, cls=DecimalEncoder, separators=(",", ":"))
+        for item in data
+    )
+
+    s3.put_object(
+        Bucket=bucket_name,
+        Key=file_key,
+        Body=jsonl_content,
+        ContentType="application/json"
+    )
+
+
+def append_items_to_s3(bucket_name: str, file_key: str, new_items: list) -> dict:
+    """
+    Appends unique items to JSONL file in S3.
+    Deduplication key = pk + sk
+    """
+    existing_data = read_existing_file(bucket_name, file_key)
+
+    existing_keys = {
+        f"{item.get('pk')}|{item.get('sk')}"
+        for item in existing_data
+    }
+
+    unique_new_items = []
+    for item in new_items:
+        item_key = f"{item.get('pk')}|{item.get('sk')}"
+        if item_key not in existing_keys:
+            unique_new_items.append(item)
+            existing_keys.add(item_key)
+
+    existing_data.extend(unique_new_items)
+    write_jsonl_to_s3(bucket_name, file_key, existing_data)
+
+    return {
+        "total_items": len(existing_data),
+        "newly_added": len(unique_new_items)
+    }
