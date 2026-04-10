@@ -1,233 +1,168 @@
 import sys
-from awsglue.utils import getResolvedOptions
-from awsglue.context import GlueContext
-from awsglue.job import Job
+import json
+from decimal import Decimal
+from typing import Dict, Any
+
 from pyspark.context import SparkContext
-from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType, StructField, StringType, BooleanType,
-    DoubleType, MapType
-)
+from pyspark.sql import SparkSession, Row
+from awsglue.context import GlueContext
 
-# -----------------------------------------------------------------------------------
-# Glue job setup
-# -----------------------------------------------------------------------------------
-args = getResolvedOptions(sys.argv, ["JOB_NAME"])
 
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args["JOB_NAME"], args)
+def init_glue_context():
+    sc = SparkContext.getOrCreate()
+    glueContext = GlueContext(sc)
+    spark = glueContext.spark_session
+    return glueContext, spark
 
-INPUT_PATH = "s3://dashboard-bucket-aaa/exports/raw_csv/"
-OUTPUT_PATH = "s3://dashboard-bucket-aaa/exports/connect_parquet/"
 
-# -----------------------------------------------------------------------------------
-# Read raw CSV
-# -----------------------------------------------------------------------------------
-df = (
-    spark.read
-    .option("header", "true")
-    .option("multiLine", "false")
-    .option("escape", '"')
-    .csv(INPUT_PATH)
-)
+def parse_dynamodb_json(dynamo_obj):
+    """
+    Recursively converts DynamoDB JSON to normal Python values.
+    Supports S, N, BOOL, NULL, M, L, SS, NS.
+    """
+    if isinstance(dynamo_obj, dict):
+        if "NULL" in dynamo_obj and dynamo_obj["NULL"] is True:
+            return None
+        if "S" in dynamo_obj:
+            return dynamo_obj["S"]
+        if "N" in dynamo_obj:
+            num_str = dynamo_obj["N"]
+            try:
+                if "." in num_str:
+                    return float(num_str)
+                return int(num_str)
+            except Exception:
+                return num_str
+        if "BOOL" in dynamo_obj:
+            return dynamo_obj["BOOL"]
+        if "SS" in dynamo_obj:
+            return dynamo_obj["SS"]
+        if "NS" in dynamo_obj:
+            out = []
+            for n in dynamo_obj["NS"]:
+                try:
+                    out.append(float(n) if "." in n else int(n))
+                except Exception:
+                    out.append(n)
+            return out
+        if "M" in dynamo_obj:
+            return {k: parse_dynamodb_json(v) for k, v in dynamo_obj["M"].items()}
+        if "L" in dynamo_obj:
+            return [parse_dynamodb_json(i) for i in dynamo_obj["L"]]
 
-# -----------------------------------------------------------------------------------
-# Normalize plain "null" strings to actual nulls
-# -----------------------------------------------------------------------------------
-for c in df.columns:
-    df = df.withColumn(
-        c,
-        F.when(
-            (F.trim(F.col(c)) == "null") | (F.trim(F.col(c)) == ""),
-            F.lit(None)
-        ).otherwise(F.col(c))
+        # normal dict
+        return {k: parse_dynamodb_json(v) for k, v in dynamo_obj.items()}
+
+    elif isinstance(dynamo_obj, list):
+        return [parse_dynamodb_json(i) for i in dynamo_obj]
+
+    return dynamo_obj
+
+
+def flatten_dict(
+    d: Dict[str, Any],
+    parent: str = "",
+    sep: str = "_",
+    list_to_json: bool = True,
+    index_before_parent: bool = False,
+    out: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    Flatten nested dict to single-level dict.
+    Example:
+      {"a": {"b": 1}} -> {"a_b": 1}
+    """
+    if out is None:
+        out = {}
+
+    for k, v in d.items():
+        new_key = f"{parent}{sep}{k}" if parent else k
+
+        if isinstance(v, dict):
+            flatten_dict(
+                v,
+                parent=new_key,
+                sep=sep,
+                list_to_json=list_to_json,
+                index_before_parent=index_before_parent,
+                out=out
+            )
+
+        elif isinstance(v, list):
+            if all(isinstance(el, dict) for el in v):
+                for idx, el in enumerate(v):
+                    idx_parent = f"{idx}{sep}{new_key}" if index_before_parent else f"{new_key}{sep}{idx}"
+                    flatten_dict(
+                        el,
+                        parent=idx_parent,
+                        sep=sep,
+                        list_to_json=list_to_json,
+                        index_before_parent=index_before_parent,
+                        out=out
+                    )
+            else:
+                out[new_key] = json.dumps(v, ensure_ascii=False) if list_to_json else v
+
+        else:
+            out[new_key] = v
+
+    return out
+
+
+def process_call_entities(glueContext, spark, database: str, table: str, output_path: str, mode: str = "overwrite"):
+    # 1) Read from Glue Catalog
+    dyf_raw = glueContext.create_dynamic_frame.from_catalog(
+        database=database,
+        table_name=table
     )
 
-# -----------------------------------------------------------------------------------
-# JSON Schemas for DynamoDB JSON string columns
-# -----------------------------------------------------------------------------------
-agent_schema = StructType([
-    StructField("Username", StructType([
-        StructField("S", StringType(), True)
-    ]), True),
-    StructField("Id", StructType([
-        StructField("S", StringType(), True)
-    ]), True)
-])
+    # 2) Convert DynamicFrame -> Spark DataFrame
+    df_raw = dyf_raw.toDF()
 
-attributes_schema = MapType(
-    StringType(),
-    StructType([
-        StructField("S", StringType(), True),
-        StructField("N", StringType(), True),
-        StructField("BOOL", BooleanType(), True)
-    ]),
-    True
-)
+    # Debug
+    print("Raw schema:")
+    df_raw.printSchema()
 
-contact_lens_schema = StructType([
-    StructField("Sentiment", StructType([
-        StructField("M", StructType([
-            StructField("Overall", StructType([
-                StructField("S", StringType(), True)
-            ]), True),
-            StructField("Score", StructType([
-                StructField("N", StringType(), True)
-            ]), True)
-        ]), True)
-    ]), True)
-])
+    # 3) If empty input, fail fast
+    if len(df_raw.columns) == 0:
+        raise ValueError("Input DataFrame has 0 columns. Check crawler/table schema.")
 
-endpoint_schema = StructType([
-    StructField("Address", StructType([
-        StructField("S", StringType(), True)
-    ]), True),
-    StructField("Type", StructType([
-        StructField("S", StringType(), True)
-    ]), True)
-])
+    if df_raw.rdd.isEmpty():
+        raise ValueError("Input DataFrame has no rows. Nothing to transform.")
 
-metrics_schema = StructType([
-    StructField("HoldTime", StructType([
-        StructField("N", StringType(), True)
-    ]), True),
-    StructField("InteractionTime", StructType([
-        StructField("N", StringType(), True)
-    ]), True),
-    StructField("HandleTime", StructType([
-        StructField("N", StringType(), True)
-    ]), True),
-    StructField("AfterContactWorkTime", StructType([
-        StructField("N", StringType(), True)
-    ]), True),
-    StructField("Queue", StructType([
-        StructField("M", StructType([
-            StructField("Duration", StructType([
-                StructField("N", StringType(), True)
-            ]), True),
-            StructField("EnqueueTimestamp", StructType([
-                StructField("S", StringType(), True)
-            ]), True)
-        ]), True)
-    ]), True)
-])
+    # 4) Convert each row -> dict -> parse DynamoDB JSON -> flatten
+    parsed_rdd = df_raw.rdd.map(lambda row: row.asDict(recursive=True)) \
+                           .map(parse_dynamodb_json) \
+                           .map(flatten_dict)
 
-queue_schema = StructType([
-    StructField("Id", StructType([
-        StructField("S", StringType(), True)
-    ]), True),
-    StructField("Name", StructType([
-        StructField("S", StringType(), True)
-    ]), True)
-])
+    # 5) If parsing produced nothing useful, stop early
+    sample = parsed_rdd.take(1)
+    if not sample:
+        raise ValueError("No parsed rows produced.")
+    if not sample[0]:
+        raise ValueError("Parsed rows are empty dicts. Check source DynamoDB JSON structure.")
 
-recording_schema = StructType([
-    StructField("Status", StructType([
-        StructField("S", StringType(), True)
-    ]), True),
-    StructField("Location", StructType([
-        StructField("S", StringType(), True)
-    ]), True)
-])
+    # 6) Rebuild Spark DataFrame
+    df_flat = spark.createDataFrame(parsed_rdd.map(lambda x: Row(**x)))
 
-system_endpoint_schema = StructType([
-    StructField("Address", StructType([
-        StructField("S", StringType(), True)
-    ]), True),
-    StructField("Type", StructType([
-        StructField("S", StringType(), True)
-    ]), True)
-])
+    print("Flattened schema:")
+    df_flat.printSchema()
 
-# -----------------------------------------------------------------------------------
-# Parse JSON string columns
-# -----------------------------------------------------------------------------------
-df = (
-    df
-    .withColumn("Agent_json", F.from_json(F.col("Agent"), agent_schema))
-    .withColumn("Attributes_json", F.from_json(F.col("Attributes"), attributes_schema))
-    .withColumn("ContactLens_json", F.from_json(F.col("ContactLens"), contact_lens_schema))
-    .withColumn("CustomerEndpoint_json", F.from_json(F.col("CustomerEndpoint"), endpoint_schema))
-    .withColumn("Metrics_json", F.from_json(F.col("Metrics"), metrics_schema))
-    .withColumn("Queue_json", F.from_json(F.col("Queue"), queue_schema))
-    .withColumn("Recording_json", F.from_json(F.col("Recording"), recording_schema))
-    .withColumn("SystemEndpoint_json", F.from_json(F.col("SystemEndpoint"), system_endpoint_schema))
-)
+    if len(df_flat.columns) == 0:
+        raise ValueError("Flattened DataFrame has 0 columns. Cannot write parquet.")
 
-# -----------------------------------------------------------------------------------
-# Flatten + type cast
-# -----------------------------------------------------------------------------------
-df_flat = df.select(
-    F.col("pk").alias("pk"),
-    F.col("sk").alias("sk"),
-    F.col("Channel").alias("channel"),
-    F.col("ConnectedToAgentTimestamp").alias("connected_to_agent_timestamp"),
-    F.col("ConnectedToSystemTimestamp").alias("connected_to_system_timestamp"),
-    F.col("ContactId").alias("contact_id"),
-    F.col("DisconnectReason").alias("disconnect_reason"),
-    F.col("DisconnectTimestamp").alias("disconnect_timestamp"),
-    F.col("InitiationMethod").alias("initiation_method"),
-    F.col("InitiationTimestamp").alias("initiation_timestamp"),
-    F.col("InstanceId").alias("instance_id"),
-    F.col("NextContactId").alias("next_contact_id"),
-    F.col("PreviousContactId").alias("previous_contact_id"),
+    # 7) Write parquet
+    df_flat.write.mode(mode).parquet(output_path)
 
-    F.col("Agent_json.Username.S").alias("agent_username"),
-    F.col("Agent_json.Id.S").alias("agent_id"),
+    print(f"Wrote parquet to {output_path} (mode={mode})")
+    return df_flat
 
-    F.col("Attributes_json")["issueType"]["S"].alias("issue_type"),
-    F.col("Attributes_json")["customerType"]["S"].alias("customer_type"),
-    F.col("Attributes_json")["language"]["S"].alias("language"),
-    F.col("Attributes_json")["region"]["S"].alias("region"),
 
-    F.col("ContactLens_json.Sentiment.M.Overall.S").alias("sentiment_overall"),
-    F.col("ContactLens_json.Sentiment.M.Score.N").cast(DoubleType()).alias("sentiment_score"),
+# Example usage
+glueContext, spark = init_glue_context()
 
-    F.col("CustomerEndpoint_json.Address.S").alias("customer_address"),
-    F.col("CustomerEndpoint_json.Type.S").alias("customer_endpoint_type"),
+database = "aaa_dashboard_call-entities-raw_database"
+table = "call_entities_raw"
+output_path = "sbuket/"
 
-    F.col("Metrics_json.HoldTime.N").cast(DoubleType()).alias("hold_time"),
-    F.col("Metrics_json.InteractionTime.N").cast(DoubleType()).alias("interaction_time"),
-    F.col("Metrics_json.HandleTime.N").cast(DoubleType()).alias("handle_time"),
-    F.col("Metrics_json.AfterContactWorkTime.N").cast(DoubleType()).alias("after_contact_work_time"),
-    F.col("Metrics_json.Queue.M.Duration.N").cast(DoubleType()).alias("queue_duration"),
-    F.col("Metrics_json.Queue.M.EnqueueTimestamp.S").alias("queue_enqueue_timestamp"),
-
-    F.col("Queue_json.Id.S").alias("queue_id"),
-    F.col("Queue_json.Name.S").alias("queue_name"),
-
-    F.col("Recording_json.Status.S").alias("recording_status"),
-    F.col("Recording_json.Location.S").alias("recording_location"),
-
-    F.col("SystemEndpoint_json.Address.S").alias("system_address"),
-    F.col("SystemEndpoint_json.Type.S").alias("system_type")
-)
-
-# -----------------------------------------------------------------------------------
-# Add partition column
-# -----------------------------------------------------------------------------------
-df_flat = (
-    df_flat
-    .withColumn("event_timestamp", F.to_timestamp("initiation_timestamp", "yyyy-MM-dd'T'HH:mm:ssX"))
-    .withColumn("event_date", F.to_date("event_timestamp"))
-)
-
-# -----------------------------------------------------------------------------------
-# Optional dedupe by contact_id + sk
-# -----------------------------------------------------------------------------------
-df_flat = df_flat.dropDuplicates(["contact_id", "sk"])
-
-# -----------------------------------------------------------------------------------
-# Write parquet partitioned by event_date
-# -----------------------------------------------------------------------------------
-(
-    df_flat.write
-    .mode("overwrite")
-    .partitionBy("event_date")
-    .parquet(OUTPUT_PATH)
-)
-
-job.commit()
+df_final = process_call_entities(glueContext, spark, database, table, output_path)
